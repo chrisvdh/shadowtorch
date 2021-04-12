@@ -146,7 +146,7 @@ class ShadowTorch(object):
          of the same dimension as the initial parameters"""
          v_density = torch.distributions.Normal(0,3)
          potential1 = -v_density.log_prob(self.parameters[0])
-         x_density = torch.distributions.Normal(0,torch.exp(-self.parameters[0])**0.5)
+         x_density = torch.distributions.Normal(0,torch.exp(self.parameters[0])**0.5)
          potential2 = -x_density.log_prob(self.parameters[1:]).sum()
          return potential1 + potential2
 
