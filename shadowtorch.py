@@ -1,33 +1,54 @@
 """
-@author: Chris van der Heide and Liam Hodgkinson
-@email: chris.vdh@gmail.com
+Copyright (c) 2021 Chris van der Heide and Liam Hodgkinson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
 
 import torch
-from tqdm import tqdm
-import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.graphics.tsaplots import plot_pacf
 import pymc3
-from matplotlib.colors import LightSource, Normalize
 import seaborn as sns
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn import preprocessing
 import time
+import scipy
 torch.set_default_dtype(torch.float64)
 
-class ShadowTorch(object):
-    """Samples from a Bayesian neural network with Gaussian prior using the
-    standard Hamiltonian Monte Carlo algorithm; see (Neal, 2012)"""
+def scipy_lbfgs(fun, jac, x0):
+    """A wrapper around the SciPy implementation of L-BFGS-B"""
+    result = scipy.optimize.minimize(fun, x0, jac=jac, method='L-BFGS-B')
+    if not result['success']:
+        raise RuntimeError("L-BFGS-B failed to converge")
+    return result['x']
 
+
+
+class ShadowTorch(object):
     def __init__(self, initial_parameters, samples = 100, potential = 'blr',
                  integrator = 'HMC', shadow = False, metric = 'Euclidean',
                  momentum_retention = 0.,  dataset=None, labels = None, stepsize=.1, 
                  prior_var=100.0, max_leapfrog_steps=6, max_fixed_point_iterations = 100,
-                 fixed_point_threshold = 1e-3, softabs_constant = 1e6, verbose = False,
-                 jitter = 5e-3, prior = 'Gaussian', trajectories = False):
+                 fixed_point_threshold = 1e-3, softabs_constant = 1e6, max_shadow = None,
+                 verbose = False, jitter = 5e-3, prior = 'Gaussian', trajectories = False,
+                 random_retention = False, store_paths = False):
         self.parameters = initial_parameters.requires_grad_(True)
         self.momentum = torch.zeros_like(self.parameters)
         self.n_samples = samples
@@ -62,6 +83,7 @@ class ShadowTorch(object):
         self.momentum_accepts_ = []
         self.momentum_accepted_ = []
         self.rands_ = []
+        self.paths = []
         self.metric_ = torch.zeros(initial_parameters.shape[0],initial_parameters.shape[0])
         self.inverse_ = torch.zeros_like(self.metric_)
         self.cholesky_inv_ = torch.zeros_like(self.metric_)
@@ -77,20 +99,18 @@ class ShadowTorch(object):
         self.elapsed = 0
         self.trajectories = trajectories
         self._cov = torch.zeros(1)
+        self.random_retention = random_retention
+        self.degenerate = False
+        self.degenerates = 0
+        self.completed = False
+        self.store_paths = store_paths
+        self.max_shadow = max_shadow
         
-        
-
     def get_cross_entropy(self):
         """Returns U(q), the negative log-posterior formed from Bayesian Logistic Regression"""
         assert (self.dataset is not None) and (self.labels is not None), 'Logistic Regression requires a dataset and labels.'
         potential = 0.0
-        if self._prior == 'Sparse':
-             n = torch.tensor(self.dataset.shape[1],dtype = torch.float64)
-             coefficients = self.parameters[-1]*self.parameters[:n]*self.parameters[n:-1]
-             logits = self.dataset @ coefficients
-        else:
-            n = torch.tensor(self.parameters.shape[0],dtype = torch.float64)
-            logits = self.dataset @ self.parameters
+        logits = self.dataset @ self.parameters[:self.dataset.shape[1]]
         max_logits = torch.max(torch.zeros(logits.shape[0]),logits)
         potential = (-logits @ self.labels.t() + torch.sum(max_logits) + torch.sum(
             torch.log(torch.exp(-max_logits)+torch.exp(logits - max_logits))))# * n.reciprocal())
@@ -104,13 +124,14 @@ class ShadowTorch(object):
         elif self._prior == 'Cauchy':
             dimconst = (self.parameters.shape[0] + 1)/2.
             prior = dimconst*torch.log(self.prior_var + torch.sum(self.parameters ** 2))
-#        elif self._prior == 'Sparse':
-#            n = self.dataset.shape[1]
-#            gauss_prior = 0.5 * torch.sum(torch.exp(self.parameters[2*n] * torch.exp(self.parameters[n:2*n-1]) * self.parameters[:n-1] ** 2)
-#            gamma_density = torch.distributions.Gamma(torch.tensor([0.5]),torch.tensor([0.5]))
-#            lambda_prior = -gamma_density.log_prob(torch.exp(self.parameters[n:])).sum()
-#           prior = gauss_prior + lambda_prior
-#            prior = torch.tensor([0])
+        elif self._prior == 'Sparse':
+            n = self.dataset.shape[1]
+            gauss_prior = 0.5 * torch.sum(torch.exp(self.parameters[-1] * torch.exp(self.parameters[n:2*n]) * self.parameters[:n] ** 2))
+            gamma_density = torch.distributions.Gamma(1.5,0.5)
+#            gamma_prior = -gamma_density.log_prob(torch.exp(self.parameters[n:])).sum()
+#            lambda_density = torch.distributions.Gamma(1.5,0.5)
+            lambda_prior = -gamma_density.log_prob(torch.exp(self.parameters[n:])).sum()
+            prior = gauss_prior + lambda_prior
         return prior
         
     def get_banana(self):
@@ -207,7 +228,7 @@ class ShadowTorch(object):
         '''
         Compute the Hessian of the potential with respect to the parameters
         '''
-        if self._potential == 'blr':
+        if self._potential == 'blr' and self._prior == 'Gaussian':
             logits = self.dataset @ self.parameters
             el = torch.exp(logits)
             probs = el/(1. + el)
@@ -221,17 +242,28 @@ class ShadowTorch(object):
             hess[1:,0] = self.parameters[1:]*torch.exp(self.parameters[0])
             hess[0,1:] = hess[1:,0]
             hess[1:,1:] = torch.exp(self.parameters[0]) * torch.eye(self.parameters.shape[0]-1)
-        elif self._metric == 'Sparse':
+        elif self._prior == 'Sparse':
+            rate = 1.5
             n = self.dataset.shape[1]
+            cehess = torch.zeros(n,n)
+            logits = logits = self.dataset @ self.parameters[:n]
+            el = torch.exp(logits)
+            probs = el/(1. + el)
+            pf = probs - probs**2
+            px = pf*self.dataset.t()
+            fish = px @ self.dataset
             hess = torch.zeros(self.parameters.numel(),self.parameters.numel())
-            sigmas = torch.exp(self.parameters[n:2*n-1])
+            sigmas = torch.exp(self.parameters[n:2*n])
             tau = torch.exp(self.parameters[-1])
-            betas = self.parameters[:n-1]
-            hess[:n-1,:n-1] = torch.diag(tau * sigmas)
-            cross = torch.diag(self.parameters[:n-1] * sigmas * tau)
-            hess[:n-1,n:2*n-1] = cross
-            hess[n:2*n-1,:n-1] = cross
-            vec = torch.tensor([0.])
+            hess[:n,:n] = cehess + torch.diag(tau * sigmas)
+            vec = self.parameters[:n] * sigmas * tau
+            cross = torch.diag(vec)
+            hess[:n,n:2*n] = cross
+            hess[n:2*n,:n] = cross
+            hess[:n,-1] = vec
+            hess[-1,:n] = vec
+            hess[n:2*n,n:2*n] = torch.diag(vec + rate * sigmas)
+            hess[-1,-1] = torch.sum(0.5 * tau * sigmas * self.parameters[:n]**2) + rate * tau
         else:
             gradient = torch.autograd.grad(self.potential_, self.parameters, create_graph=True, allow_unused=False)[0]
             hess = torch.zeros(self.parameters.numel(),self.parameters.numel())
@@ -239,14 +271,6 @@ class ShadowTorch(object):
                 hess[row] = torch.autograd.grad(gradient[row], self.parameters, create_graph=True)[0]
                 del gradient
         return hess
-    
-    def get_grads(self):
-        logits = self.dataset @ self.parameters
-        el = torch.exp(logits)
-        probs = el/(1. + el)
-        yp = self.labels - probs
-        dU = yp @ self.dataset + self.parameters/self.prior_var
-        return None
 
     def resample_momenta(self, init = False):
         if (self.shadow == False) or init:
@@ -268,10 +292,13 @@ class ShadowTorch(object):
             self.parameters = self.parameters.detach().requires_grad_(True)
             self.hamiltonian_ = self.get_hamiltonian()
             #noisey_kinetic = 0.5 * momentum_sample @ self.inverse_ @ momentum_sample.t()
-            energy_ratio = torch.tensor(1.)#*torch.max(noisey_kinetic/self.kinetic_, torch.tensor(0.99))
-            proposed_momentum = torch.sqrt(energy_ratio * self.momentum_retention
+            if self.random_retention:
+                energy_ratio = torch.rand(1)       
+            else:    
+                energy_ratio = torch.tensor(1.)#*torch.max(noisey_kinetic/self.kinetic_, torch.tensor(0.99))
+            proposed_momentum = torch.sqrt(energy_ratio * self.momentum_retention**2
                                            ) * self.momentum + torch.sqrt(
-                                               1 - energy_ratio * self.momentum_retention) * momentum_sample
+                                               1 - energy_ratio * self.momentum_retention**2) * momentum_sample
             proposed_kinetic = 0.5 * proposed_momentum @ self.inverse_ @ proposed_momentum.t()
             proposed_hamiltonian = self.hamiltonian_ + proposed_kinetic - self.kinetic_
             #this stuff wont work
@@ -330,39 +357,28 @@ class ShadowTorch(object):
         p -> p_0 - 1/2 * delta * dH/dq(q,p)"""
         stored_momentum = self.momentum.clone()
         rejected = False
-        best_momentum = self.momentum.clone()
         best_diff = torch.tensor(100.)
         for iter in range(self._max_fixed_point_iterations):
             old_momentum = self.momentum.clone()
             self.parameters = self.parameters.detach().requires_grad_(True)
             hamiltonian = self.get_hamiltonian()
             d_hamiltonian = torch.autograd.grad(hamiltonian,self.parameters,retain_graph = True)[0]
-            #nancheck and jitter go here -> cobb adds rand*eye to the metric.
-            #avoid if possible since this changes the energy and dynamics of the system
             self.momentum = stored_momentum - 0.5 * self.stepsize * d_hamiltonian
             if self._is_nanned(self.momentum):
                 rejected = True
                 self.momentum = old_momentum
-#                if self.verbose:
-                print('Nanned during momentum update {}'.format(iter))
+                if self.verbose:
+                    print('Nanned during momentum update {}'.format(iter))
                 break
             diff = torch.max((old_momentum - self.momentum) ** 2)
             if diff < self._fixed_point_threshold:
                 break
             if diff<best_diff:
                 best_diff = diff
-#                best_momentum = self.momentum
-#            if diff > 10.:
-#                rejected = True
-#                if self.verbose:
-#                print('Divergence during momentum update')
-#                self.momentum_diverged += 1
-#                self.momentum = best_momentum
-#                break   
             elif iter == self._max_fixed_point_iterations-1:
                 rejected = True
-#                if self.verbose:
-                print('Exceeded maximum iterations during momentum update')
+                if self.verbose:
+                    print('Exceeded maximum iterations during momentum update')
                 break
 #                print('Warning: reached {} iterations in momentum update. Smallest iteration ({}) was selected'.format(self._max_fixed_point_iterations, best_diff.item()))
         momentum = self.momentum
@@ -382,8 +398,8 @@ class ShadowTorch(object):
             if self._is_nanned(self.parameters):
                 rejected = True
                 self.parameters = stored_parameters
-#                if self.verbose:
-                print('Nanned during parameter update')
+                if self.verbose:
+                    print('Nanned during parameter update')
                 break
             previous_parameters = self.parameters.detach().clone()
             self.potential_ = self.get_potential()
@@ -395,24 +411,16 @@ class ShadowTorch(object):
                 break
             if diff<best_diff:
                 best_diff = diff
-                best_drift = self.parameters
-#            if diff > 10.:
-#                rejected = True
-##                if self.verbose:
-#                print('Divergence during parameter update')
-#                self.parameters_diverged += 1
-#                self.parameters = best_drift
-#                break                
+                best_drift = self.parameters              
             elif iter == self._max_fixed_point_iterations-1:
                 self.parameters = best_drift
                 rejected = True
-#                if self.verbose:
-                print('Exceeded maximum iterations during parameter update')
+                if self.verbose:
+                    print('Exceeded maximum iterations during parameter update')
                 break
-#                print('Warning: reached {} iterations in parameter update. Smallest iteration ({}) was selected'.format(self._max_fixed_point_iterations, best_diff.item()))
         params = self.parameters
         return params, rejected
-    
+
     def explicit_drift(self):
         """Applies the explicit momentum update q -> q + delta * dH/dp"""
         params = self.parameters + self.stepsize * self.momentum
@@ -420,50 +428,80 @@ class ShadowTorch(object):
     
     def explicit_half_kick(self):
         """Applies the explicit momentum update p -> p - 1/2 * delta * dH/dq"""
+        rejected = False
         momentum = self.momentum.clone()
+        old_momentum = momentum.clone()
         hamiltonian = self.get_hamiltonian()
         d_hamiltonian = torch.autograd.grad(hamiltonian, self.parameters, retain_graph=False)[0]
-        #they also put a nancheck and jitter in here - see the comment in implicit_half_kick()
         momentum -= 0.5 * self.stepsize * d_hamiltonian
-        return momentum
+        if self._is_nanned(self.momentum):
+            rejected = True
+            self.momentum = old_momentum
+#            if self.verbose:
+            print('Nanned during explit momentum update {}'.format(iter))
+        return momentum, rejected
 
     def step(self):
         """Draws a single HMC sample"""
-        leapfrog_steps = torch.ceil(self._max_leapfrog_steps * torch.rand(1)).int()
+        if self.store_paths:
+            leapfrog_steps = self._max_leapfrog_steps
+        else:
+            leapfrog_steps = torch.ceil(self._max_leapfrog_steps * torch.rand(1)).int()
         self.potential_ = self.get_potential()
         self.metric_ = self.get_metric()
-        self.momentum = self.resample_momenta(init = True)
+        self.momentum = self.resample_momenta()
         self.hamiltonian_ = self.get_hamiltonian()
         old_hamiltonian = self.hamiltonian_
         if self.shadow:
-            old_shadow = self.shadow_.clone()
+            if self.max_shadow is not None:
+                old_shadow = torch.max(self.shadow_.clone() + self.max_shadow, old_hamiltonian)
+            else:
+                old_shadow = self.shadow_.clone()
         rejected = False
         for step in range(leapfrog_steps):
-            if self._integrator == 'RMHMC':
-#                self.momentum = self.implicit_half_kick()
+            if (self._integrator == 'RMHMC') and (self.lbfgs == False):
                 self.momentum, rejected = self.implicit_half_kick()
                 self.parameters = self.parameters.detach().requires_grad_(True)
-                if rejected == True:
+                if rejected:
                     break
-#                self.parameters = self.implicit_drift()
                 self.parameters, rejected = self.implicit_drift()
                 self.parameters = self.parameters.detach().requires_grad_(True)
-                if rejected == True:
+                if rejected:
+                    break
+                self.momentum, rejected = self.explicit_half_kick()
+                self.parameters = self.parameters.detach().requires_grad_(True)
+                if rejected:
+                    break
+            elif self.lbfgs == True:
+                self.momentum, rejected = self.lbfgs_half_kick()
+                self.parameters = self.parameters.detach().requires_grad_(True)
+                if rejected:
+                    break
+                self.parameters, rejected = self.lbfgs_drift()
+                self.parameters = self.parameters.detach().requires_grad_(True)
+                if rejected:
                     break
                 self.momentum = self.explicit_half_kick()
                 self.parameters = self.parameters.detach().requires_grad_(True)
+                if rejected:
+                    break
             else:
-                self.momentum = self.explicit_half_kick()
+                self.momentum, rejected = self.explicit_half_kick()
                 self.parameters = self.parameters.detach().requires_grad_(True)
                 self.parameters = self.explicit_drift()
                 self.parameters = self.parameters.detach().requires_grad_(True)
-                self.momentum = self.explicit_half_kick()
+                self.momentum, rejected = self.explicit_half_kick()
                 self.parameters = self.parameters.detach().requires_grad_(True)
+            if self.store_paths:
+                self.paths.append(self.parameters.detach())
         new_hamiltonian = self.get_hamiltonian()
         ratio = old_hamiltonian - new_hamiltonian
         self.hamiltonian_error.append(ratio.detach().unsqueeze(0))
         if self.shadow:
-            new_shadow = self.get_shadow()
+            if self.max_shadow is not None:
+                new_shadow = torch.max(self.get_shadow() + self.max_shadow, new_hamiltonian)
+            else:
+                new_shadow = self.get_shadow()
             shadow_error = old_shadow - new_shadow
             newratio = ratio + shadow_error
             self.shadow_hamiltonian_error.append(newratio.detach().unsqueeze(0))
@@ -475,20 +513,21 @@ class ShadowTorch(object):
             rejected = True
 
         if rejected:
+            if (len(self.momenta) > 10) and (self.momenta[-1] == self.momenta[-10]).sum().item():
+                self.degenerate = True
             self.rejected += 1
             self.momentum = self.momenta[-1]
             self.parameters = self.samples[-1].clone().detach().requires_grad_(True)
             if self.shadow:
-                radon_nikodym = torch.exp(-old_shadow).unsqueeze(0)
+                radon_nikodym = torch.exp(old_shadow).unsqueeze(0)
             
             if self.verbose:
                 print("(Rejected)", int(self.acceptance_rate() * 100), "%; Log-ratio: ",
                       ratio.detach())
         else:
             self.accepted += 1
-#            self.momentum = -self.momentum
             if self.shadow:
-                radon_nikodym = torch.exp(-new_shadow).unsqueeze(0)
+                radon_nikodym = torch.exp(new_shadow).unsqueeze(0)
             if self.verbose:
                 print("(Accepted)", int(self.acceptance_rate() * 100), "%; Log-ratio: ",
                       ratio.detach())
@@ -528,8 +567,14 @@ class ShadowTorch(object):
         ham_rejects = nums.sum().item()
 #        total = float(self.accepted + self.rejected)
         return ham_rejects
-            
+    
     def sample_model(self):
+        while not self.completed:
+            self.degenerate = False
+            self.draw_samples()
+        return self.fetch_samples()
+    
+    def draw_samples(self):
         """Run HMC to obtain samples"""
         if self._integrator == 'HMC':       
             self.momentum = torch.distributions.Normal(torch.zeros_like(self.parameters), torch.ones_like(self.parameters)).sample()
@@ -540,30 +585,66 @@ class ShadowTorch(object):
             self.jitters[1] = 0.
         self.potential_ = self.get_potential()
         self.hamiltonian_ = self.get_hamiltonian()
-        self.momentum = self.resample_momenta()
+        self.momentum = self.resample_momenta(init=True)
         self.momenta.append(self.momentum)
         if self.shadow:
             self.shadow_ = self.get_shadow()
+        finished = 0
+        counter = 0
         if self.verbose:
             for sample in range(self.n_samples):
                 self.step()
+                if self.degenerate:
+                    break
+                finished += 1
         else:
-            for _ in tqdm(range(self.n_samples)):
+#            for _ in tqdm(range(self.n_samples)):
+            for sample in range(self.n_samples):
                 self.step()
+                if self.degenerate:
+                    break
+                finished += 1
+                counter += 1
+                if counter > self.n_samples * 0.05:
+                    counter = 0
+                    print('('+str(int((sample+1)/self.n_samples*100))+'% complete)', int(self.accepted),'of', int(self.accepted + self.rejected), 'accepted', '('+str(int((self.accepted)/(self.accepted+self.rejected)*100))+'%)')
         total = float(self.accepted + self.rejected)
         end = time.time()
-        self.elapsed += end-start
-        print('\n', int(self.accepted), ' of ', int(self.accepted + self.rejected), ' samples accepted in', self.elapsed, ' seconds (', 100 * self.accepted/total,'%).')
-        return self.fetch_samples()
-    
+        if total >= self.n_samples:
+            self.completed = True
+            self.elapsed += end-start
+            print('\n', int(self.accepted), ' of ', int(self.accepted + self.rejected), ' samples accepted in', self.elapsed, ' seconds (', 100 * self.accepted/total,'%).')
+            return None
+        else:
+            self.degenerates +=1
+            self.find_mode()
+            self.parameters = params_init + torch.randn(self.parameters.shape[0])/100
+            self.reinitiate_samples()
+            self.resample_momenta(init = True)
+            return None
+        
+    def reinitiate_samples(self):
+        self.momenta = []
+        self.hamiltonians = []
+        self.shadows = []
+        self.radon_nikodym = []
+        self.hamiltonian_error = []
+        self.shadow_hamiltonian_error = []
+        self.momentum_accepts_ = []
+        self.momentum_accepted_ = []
+        self.rands_ = []
+        self.samples = [self.parameters.detach()]
+        self.rejected = 0
+        self.accepted = 0
+        
     def plot_pacf(self, dim=0, burn = 50, max_lags = 50):
         plot_pacf(self.fetch_samples()[burn:,dim].detach(), lags=max_lags)
         plt.show()
         
-    def ess(self,dim=0,burn=50, is_ess=True):
-        ess = pymc3.ess(self.fetch_samples()[burn:,dim].detach().numpy())
+    def ess(self,dim=0,burn=50,clip=0, is_ess=True):
+        ess = pymc3.ess(self.fetch_samples()[burn:len(self.samples)-clip,dim].detach().numpy())
         if self.shadow and is_ess == True:
-            weights = torch.cat(self.radon_nikodym[burn:],dim=0).reshape(-1,1).detach()
+            weights = torch.cat(self.radon_nikodym[burn:len(self.samples)-clip],dim=0).reshape(-1,1).detach()
             normed_weights = weights/weights.sum()
             is_ess = torch.sum(normed_weights**2).reciprocal()
             adjusted_ess = ess*is_ess/weights.shape[0]
@@ -593,12 +674,11 @@ class ShadowTorch(object):
             plt.plot(wbcd_shadow_probs[burn:].numpy(),c='#C11B17')
             plt.show()
         
-    def find_mode(self, its = 50, step = 0.1):
-        for it in range(its):
+    def find_mode(self, its = 500, step = 0.01):
             self.parameters = self.parameters.detach().requires_grad_(True)
             potential = self.get_potential()
-            d_hamiltonian = torch.autograd.grad(potential, self.parameters, retain_graph=False)[0]
-            self.parameters = self.parameters - step*d_hamiltonian
+            d_potential = torch.autograd.grad(potential, self.parameters, retain_graph=False)[0]
+            self.parameters = self.parameters - step*d_potential
     
     def summarise(self, dim = 0, burn = 50, max_lags = 100):
         print(self.hamiltonian_rejects())
@@ -627,3 +707,49 @@ class ShadowTorch(object):
         plt.subplot(4,4,16)
         plt.plot(samples[:,:].numpy())
         plt.show
+
+def load_dataset(dataset = 'german', seed = 42):
+    if dataset == 'german':
+        rawdata = pd.read_csv('german_numeric.csv',sep='\s+',header = None)
+        data = rawdata.loc[:,0:23]
+        preds = rawdata[24]
+        pred = preds - 1
+        X_train,X_test, y_train, y_test = train_test_split(data,pred,random_state = seed)
+    elif dataset == 'australian':
+        rawdata = pd.read_csv('australian.dat',sep='\s+',header = None)
+        data = rawdata.loc[:,0:13]
+        preds = rawdata[14]
+        pred = preds - 1
+        X_train,X_test, y_train, y_test = train_test_split(data,preds,random_state = seed)
+    elif dataset == 'breast':
+        rawdata = pd.read_csv('wdbc.csv',header = None)
+        data = rawdata.loc[:,1:]
+        preds = rawdata[0]
+        X_train,X_test, y_train, y_test = train_test_split(data,preds,random_state = seed)
+    elif dataset == 'parkinsons':
+        rawdata = pd.read_csv('ReplicatedAcousticFeatures-ParkinsonDatabase.csv', header = None)
+        data = rawdata.loc[:,2:]
+        preds = rawdata[1]
+        X_train,X_test, y_train, y_test = train_test_split(data,preds,random_state = seed)
+    elif dataset == 'divorce':
+        rawdata = pd.read_csv('divorce.csv', sep = ';', header = None)
+        data = rawdata.loc[:,:53]
+        preds = rawdata[54]
+        X_train,X_test, y_train, y_test = train_test_split(data,preds,random_state = seed)
+    elif dataset == 'sonar':
+        rawdata = pd.read_csv('sonar.csv',header = None)
+        data = rawdata.loc[:,0:59]
+        preds = rawdata[60]
+        X_train,X_test, y_train, y_test = train_test_split(data,preds,random_state = seed)
+    means, stdev = X_train.mean(), X_train.std()
+    X_norm = (X_train - means)/stdev
+    X_testnorm = (X_test - means)/stdev
+    (N,D) = X_norm.shape
+    D +=1
+    XX = torch.tensor(X_norm.values)
+    XT = torch.tensor(X_testnorm.values)
+    labels = torch.tensor(y_train.values,dtype = torch.float64)
+    bias = torch.ones(N,1)
+    XX = torch.cat((bias,XX),1)
+    XT = torch.cat((torch.ones(XT.shape[0],1),XT),1)
+    return XX,  labels
